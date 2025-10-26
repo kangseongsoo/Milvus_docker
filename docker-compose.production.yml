@@ -1,0 +1,179 @@
+version: '3.8'
+
+# 프로덕션 환경 (외부 스토리지 서버 사용)
+# 사용법: docker-compose -f docker-compose.production.yml up -d
+
+services:
+  # Milvus Standalone용 etcd
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=10000      # 10000개 리비전 (대용량 메타데이터용)
+      - ETCD_QUOTA_BACKEND_BYTES=8589934592       # 8GB (메타데이터 증가)
+      - ETCD_SNAPSHOT_COUNT=100000               # 10만개 스냅샷
+    volumes:
+      # 외부 스토리지 마운트 경로 지정
+      - ${STORAGE_SERVER_PATH}/etcd:/etcd
+      # 예: /mnt/storage/milvus-data/etcd:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - milvus
+
+  # Milvus Standalone용 MinIO
+  minio:
+    container_name: milvus-minio
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9001:9001"
+      - "9000:9000"
+    volumes:
+      # 외부 스토리지 마운트 경로 지정
+      - ${STORAGE_SERVER_PATH}/minio:/minio_data
+      # 예: /mnt/storage/milvus-data/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - milvus
+
+  # Milvus Standalone
+  milvus:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.3.5
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      # 대규모 환경 최적화 (400개 컬렉션, 4000개 파티션용)
+      MILVUS_QUERYNODE_CACHE_SIZE: 171798691840    # 160GB (16코어 265GB 서버용)
+      MILVUS_DATANODE_SEGMENT_SIZE: 2147483648     # 2GB (대용량 데이터용)
+      MILVUS_ROOTCOORD_DMLCHANNEL_NUM: 32          # 32개 (16코어 최적화)
+      MILVUS_COMMON_RETENTIONDAYS: 30              # 30일 보관
+      MILVUS_INDEXNODE_ENABLEDISK: "true"          # 디스크 인덱싱
+      MILVUS_QUERYNODE_LOAD_TIMEOUT: 300           # 5분 로드 타임아웃
+      MILVUS_QUERYNODE_UNLOAD_TIMEOUT: 60          # 1분 언로드 타임아웃
+      MILVUS_INDEXNODE_SCHEDULER_INTERVAL: 500     # 0.5초 스케줄러 간격
+    volumes:
+      # 외부 스토리지 마운트 경로 지정
+      - ${STORAGE_SERVER_PATH}/milvus:/var/lib/milvus
+      # 예: /mnt/storage/milvus-data/milvus:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - etcd
+      - minio
+    restart: unless-stopped
+    # 리소스 제한 (16코어 265GB 서버 최적화)
+    deploy:
+      resources:
+        limits:
+          cpus: '14'          # 16코어 중 14코어 사용
+          memory: 180G        # 180GB 메모리
+        reservations:
+          cpus: '12'          # 최소 12코어 보장
+          memory: 160G        # 최소 160GB 보장
+    networks:
+      - milvus
+
+  # Attu - Milvus 관리 UI
+  attu:
+    container_name: milvus-attu
+    image: zilliz/attu:v2.3.5
+    environment:
+      MILVUS_URL: milvus:19530
+    ports:
+      - "3000:3000"
+    depends_on:
+      - milvus
+    restart: unless-stopped
+    networks:
+      - milvus
+
+  # PostgreSQL 15 (파티셔닝 지원)
+  postgres:
+    container_name: rag-postgres
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-rag_db_chatty}
+      # 대규모 환경 최적화 (16코어 265GB 서버용)
+      POSTGRES_SHARED_BUFFERS: 10GB               # 40GB의 25%
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 30GB         # 40GB의 75%
+      POSTGRES_WORK_MEM: 512MB                    # 정렬/해시 작업용
+      POSTGRES_MAINTENANCE_WORK_MEM: 4GB          # VACUUM/인덱스 생성용
+    ports:
+      - "5432:5432"
+    volumes:
+      # 외부 스토리지 마운트 경로 지정
+      - ${STORAGE_SERVER_PATH}/postgres:/var/lib/postgresql/data
+      # 예: /mnt/storage/postgres-data:/var/lib/postgresql/data
+      - ../migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    # 리소스 제한 (16코어 265GB 서버 최적화)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'           # 16코어 중 2코어 사용
+          memory: 40G         # 40GB 메모리
+        reservations:
+          cpus: '1'           # 최소 1코어 보장
+          memory: 30G         # 최소 30GB 보장
+    networks:
+      - milvus
+    command:
+      - postgres
+      - -c
+      - shared_buffers=10GB
+      - -c
+      - effective_cache_size=30GB
+      - -c
+      - work_mem=512MB
+      - -c
+      - maintenance_work_mem=4GB
+      - -c
+      - max_connections=500                    # 대용량 연결
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+
+networks:
+  milvus:
+    driver: bridge
+
+# 볼륨 정의 없음 (외부 스토리지 사용)
+

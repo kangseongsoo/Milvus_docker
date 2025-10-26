@@ -1,0 +1,5 @@
+volumes/
+*.log
+.env
+.env.local
+
