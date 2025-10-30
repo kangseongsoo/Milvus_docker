@@ -113,6 +113,49 @@ services:
     networks:
       - milvus
 
+  # Redis 7 (캐시 및 세션 저장소)
+  redis:
+    container_name: rag-redis
+    image: redis:7-alpine
+    environment:
+      # Redis 성능 최적화 (대규모 환경용)
+      REDIS_MAXMEMORY: 8gb
+      REDIS_MAXMEMORY_POLICY: allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      # 외부 스토리지 마운트 경로 지정
+      - ${STORAGE_SERVER_PATH}/redis:/data
+      # 예: /mnt/storage/redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    # 리소스 제한 (16코어 265GB 서버 최적화)
+    deploy:
+      resources:
+        limits:
+          cpus: '1'           # 16코어 중 1코어 사용
+          memory: 8G          # 8GB 메모리
+        reservations:
+          cpus: '0.5'         # 최소 0.5코어 보장
+          memory: 4G          # 최소 4GB 보장
+    networks:
+      - milvus
+    command:
+      - redis-server
+      - --maxmemory 8gb
+      - --maxmemory-policy allkeys-lru
+      - --save 900 1
+      - --save 300 10
+      - --save 60 10000
+      - --appendonly yes
+      - --appendfsync everysec
+      - --tcp-keepalive 60
+      - --timeout 300
+
   # PostgreSQL 15 (파티셔닝 지원)
   postgres:
     container_name: rag-postgres
