@@ -70,7 +70,7 @@ docker-compose ps | grep healthy
 - Host: `localhost`
 - Port: `5432`
 - User: `postgres`
-- Password: `dktkekf0215@#`
+- Password: `password`
 - Database: `rag_db_chatty`
 
 **MinIO (Object Storage):**
